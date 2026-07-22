@@ -109,6 +109,7 @@ def run_autotune() -> int:
         warmup_runs=args.warmup_runs,
         timing_runs=args.timing_runs,
         trtexec_args=trtexec_args,
+        remote_model_path=args.remote_model_path,
     )
 
     if benchmark_instance is None:
@@ -308,6 +309,12 @@ Examples:
         default=None,
         help="Additional command-line arguments to pass to trtexec as a single quoted string. "
         "Example: --trtexec_benchmark_args '--fp16 --workspace=4096 --verbose'",
+    )
+    trt_group.add_argument(
+        "--remote_model_path",
+        type=str,
+        default="trtexec_benchmark_model.trt",
+        help="Path to the remote model on the device (default: trtexec_benchmark_model.trt)",
     )
 
     # Logging

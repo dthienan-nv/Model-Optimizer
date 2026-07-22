@@ -283,6 +283,7 @@ def _find_nodes_to_quantize_autotune(
     warmup_runs: int = 50,
     timing_runs: int = 100,
     trtexec_args: str | None = None,
+    remote_model_path: str = "trtexec_benchmark_model.trt",
 ) -> tuple[list[str], list[str], list[tuple[gs.Node, gs.Node, str]], list[str]]:
     """Extracts quantization information from Autotune to provide ORT quantization."""
     logger.info("Running Auto Q/DQ with TensorRT")
@@ -305,6 +306,7 @@ def _find_nodes_to_quantize_autotune(
         warmup_runs=warmup_runs,
         timing_runs=timing_runs,
         trtexec_args=trtexec_args.split() if trtexec_args else None,
+        remote_model_path=remote_model_path,
     )
 
     if benchmark_instance is None:
@@ -373,6 +375,7 @@ def quantize(
     autotune_warmup_runs: int = 50,
     autotune_timing_runs: int = 100,
     autotune_trtexec_args: str | None = None,
+    autotune_remote_model_path: str = "trtexec_benchmark_model.trt",
     **kwargs: Any,
 ) -> None:
     """Quantizes the provided ONNX model.
@@ -527,6 +530,9 @@ def quantize(
         autotune_trtexec_args:
             Additional trtexec arguments as a single quoted string.
             Example: --autotune_trtexec_args '--fp16 --workspace=4096'
+        autotune_remote_model_path:
+            Path to the remote model on the device.
+            Default is "trtexec_benchmark_model.trt".
         kwargs:
             Additional keyword arguments for int4 quantization, including:
             - awqlite_alpha_step (float): Alpha step for lite, range [0, 1].
@@ -659,6 +665,7 @@ def quantize(
                 warmup_runs=autotune_warmup_runs,
                 timing_runs=autotune_timing_runs,
                 trtexec_args=autotune_trtexec_args,
+                remote_model_path=autotune_remote_model_path,
             )
             op_types_to_quantize = op_types_to_quantize or op_types_to_quantize_autotune
             nodes_to_quantize = nodes_to_quantize or nodes_to_quantize_autotune

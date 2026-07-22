@@ -402,6 +402,12 @@ def get_parser() -> argparse.ArgumentParser:
             "set. Example: '--fp16 --workspace=4096'"
         ),
     )
+    autotune_group.add_argument(
+        "--autotune_remote_model_path",
+        type=str,
+        default="trtexec_benchmark_model.trt",
+        help="Path to the remote model on the device (default: trtexec_benchmark_model.trt)",
+    )
     return argparser
 
 
@@ -507,6 +513,7 @@ def main():
         autotune_warmup_runs=args.autotune_warmup_runs,
         autotune_timing_runs=args.autotune_timing_runs,
         autotune_trtexec_args=args.autotune_trtexec_args,
+        autotune_remote_model_path=args.autotune_remote_model_path,
     )
 
 

@@ -25,6 +25,7 @@ invoked. They cover:
 - The ``run()`` pipeline: standard local invocation; remote scp + ssh
   ``trtexec_safe`` invocation; fallback to ``trtexec --safe`` when
   ``trtexec_safe`` fails; ``sshpass`` prefix when a password is configured.
+- The configurable remote engine path (``remote_model_path``).
 - Latency parsing from both ``_STD_PATTERN`` (GPU Compute Time) and
   ``_SAFE_PATTERN`` (Average over N runs - GPU latency).
 - Error paths: non-zero trtexec returncode, scp failure, missing trtexec
@@ -32,6 +33,7 @@ invoked. They cover:
 """
 
 import re
+import shlex
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -260,7 +262,7 @@ def test_parse_remote_autotuning_url_rejects_user_starting_with_dash(evil_user):
         f"ssh://{evil_user}@10.0.0.5?"
         "remote_exec_path=/opt/trt/bin/trtexec&remote_lib_path=/opt/trt/lib"
     )
-    with pytest.raises(ValueError, match=re.escape("Remote user.*must not start with '-'")):
+    with pytest.raises(ValueError, match=r"Remote user.*must not start with '-'"):
         bm._parse_remote_autotuning_url(url)
 
 
@@ -271,7 +273,7 @@ def test_parse_remote_autotuning_url_rejects_host_starting_with_dash():
         "ssh://alice@-oproxycommand?"
         "remote_exec_path=/opt/trt/bin/trtexec&remote_lib_path=/opt/trt/lib"
     )
-    with pytest.raises(ValueError, match=re.escape("Remote host.*must not start with '-'")):
+    with pytest.raises(ValueError, match=r"Remote host.*must not start with '-'"):
         bm._parse_remote_autotuning_url(url)
 
 
@@ -551,6 +553,51 @@ def test_remote_config_requires_trtexec_10_15(tmp_path):
             timing_cache_file=str(tmp_path / "cache.bin"),
             trtexec_args=[f"--remoteAutoTuningConfig={_REMOTE_URL}"],
         )
+
+
+# --- remote_model_path (configurable remote engine path) ---
+
+
+def test_remote_model_path_defaults_to_trtexec_benchmark_model(tmp_path):
+    """Without an override, the remote engine path keeps its historical default."""
+    b = TrtExecBenchmark(timing_cache_file=str(tmp_path / "cache.bin"))
+    assert b.remote_engine_path == "trtexec_benchmark_model.trt"
+
+
+def test_remote_model_path_custom_value_stored(tmp_path):
+    """A custom ``remote_model_path`` is stored as ``remote_engine_path``."""
+    b = TrtExecBenchmark(
+        timing_cache_file=str(tmp_path / "cache.bin"),
+        remote_model_path="/data/models/custom_engine.trt",
+    )
+    assert b.remote_engine_path == "/data/models/custom_engine.trt"
+
+
+@pytest.mark.usefixtures("trtexec_version_ok")
+def test_remote_model_path_used_in_scp_and_remote_commands(tmp_path):
+    """The custom remote engine path flows into scp destination and ssh command strings."""
+    custom_path = "/data/models/custom engine.trt"  # space exercises shlex.quote
+    b = TrtExecBenchmark(
+        timing_cache_file=str(tmp_path / "cache.bin"),
+        trtexec_args=[f"--remoteAutoTuningConfig={_REMOTE_URL}"],
+        remote_model_path=custom_path,
+    )
+
+    trtexec_proc = _make_proc(stdout="")
+    scp_proc = _make_proc()
+    ssh_proc = _make_proc(stdout="[I] Average over 5 runs - GPU latency: 2.0 ms")
+
+    with patch("subprocess.run", side_effect=[trtexec_proc, scp_proc, ssh_proc]) as run_mock:
+        b.run(str(tmp_path / "m.onnx"))
+
+    _, scp_cmd, ssh_cmd, cleanup_cmd = (c.args[0] for c in run_mock.call_args_list)
+    quoted = shlex.quote(custom_path)
+    # scp destination targets the custom (quoted) remote path.
+    assert scp_cmd[-1].endswith(f":{quoted}")
+    # The remote trtexec_safe command loads the custom engine path.
+    assert f"--loadEngine={quoted}" in ssh_cmd[-1]
+    # Cleanup removes the custom engine path.
+    assert f"rm -f {quoted}" in cleanup_cmd[-1]
 
 
 # --- run() — local trtexec pipeline ---
@@ -884,7 +931,6 @@ def test_ssh_fallback_timeout_returns_inf(tmp_path):
 
 def test_std_pattern_matches_gpu_compute_time_line():
     """The std pattern matches a typical ``[I] GPU Compute Time: … median = X ms`` line."""
-    import re
 
     text = "[I] GPU Compute Time: min = 1 ms, max = 2 ms, median = 1.42 ms"
     match = re.search(bm._STD_PATTERN, text, re.IGNORECASE)
@@ -893,7 +939,6 @@ def test_std_pattern_matches_gpu_compute_time_line():
 
 def test_safe_pattern_matches_average_over_runs_line():
     """The safe pattern matches the trtexec_safe ``Average over N runs - GPU latency`` line."""
-    import re
 
     text = "[01/15/2026-12:00:00] [I] Average over 10 runs - GPU latency: 7.89 ms"
     match = re.search(bm._SAFE_PATTERN, text, re.IGNORECASE)
