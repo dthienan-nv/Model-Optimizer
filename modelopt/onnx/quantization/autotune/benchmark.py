@@ -469,9 +469,10 @@ class TrtExecBenchmark(Benchmark):
 
             cmd = [*self._base_cmd, f"--onnx={model_path}"]
             full_cmd = ["trtexec", *cmd]
-            self.logger.debug(f"Running: {' '.join(full_cmd)}")
-            # We do not specify a timeout for engine build since this could take a very long time
-            # trtexec has its own timeout wrt the remote timing server
+            self.logger.info(f"Running trtexec engine build/benchmark: {' '.join(full_cmd)}")
+            # No timeout for engine build — can take a very long time. _run_trtexec streams
+            # output and emits heartbeats so long builds do not look hung. trtexec itself
+            # enforces timeouts against the remote timing server when configured.
             result = _run_trtexec(cmd, timeout=None)
             self._write_log_file(
                 log_file,

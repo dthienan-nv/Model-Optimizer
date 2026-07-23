@@ -51,8 +51,13 @@ except ImportError:  # pragma: no cover — exercised only in TRT-less envs
 
 
 def _make_proc(returncode=0, stdout="", stderr=""):
-    """Build a ``subprocess.run``-style result object."""
+    """Build a ``subprocess.run`` / ``_run_trtexec``-style result object."""
     return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+# Local engine builds go through ``_run_trtexec`` (streaming + heartbeats).
+# Remote scp/ssh steps still use ``subprocess.run`` directly.
+_RUN_TRTEXEC = "modelopt.onnx.quantization.autotune.benchmark._run_trtexec"
 
 
 # ===========================================================================
@@ -586,11 +591,15 @@ def test_remote_model_path_used_in_scp_and_remote_commands(tmp_path):
     trtexec_proc = _make_proc(stdout="")
     scp_proc = _make_proc()
     ssh_proc = _make_proc(stdout="[I] Average over 5 runs - GPU latency: 2.0 ms")
+    cleanup_proc = _make_proc()
 
-    with patch("subprocess.run", side_effect=[trtexec_proc, scp_proc, ssh_proc]) as run_mock:
+    with (
+        patch(_RUN_TRTEXEC, return_value=trtexec_proc),
+        patch("subprocess.run", side_effect=[scp_proc, ssh_proc, cleanup_proc]) as run_mock,
+    ):
         b.run(str(tmp_path / "m.onnx"))
 
-    _, scp_cmd, ssh_cmd, cleanup_cmd = (c.args[0] for c in run_mock.call_args_list)
+    scp_cmd, ssh_cmd, cleanup_cmd = (c.args[0] for c in run_mock.call_args_list)
     quoted = shlex.quote(custom_path)
     # scp destination targets the custom (quoted) remote path.
     assert scp_cmd[-1].endswith(f":{quoted}")
@@ -609,19 +618,19 @@ def test_run_invokes_trtexec_with_onnx_path(bench, tmp_path):
     model.write_bytes(b"")
 
     proc = _make_proc(stdout="[I] GPU Compute Time: min = 1.0 ms, max = 2.0 ms, median = 1.5 ms")
-    with patch("subprocess.run", return_value=proc) as run_mock:
+    with patch(_RUN_TRTEXEC, return_value=proc) as run_mock:
         latency = bench.run(str(model))
 
     assert latency == pytest.approx(1.5)
+    # ``_run_trtexec`` receives args without the ``trtexec`` binary itself.
     cmd = run_mock.call_args.args[0]
-    assert cmd[0] == "trtexec"
     assert f"--onnx={model}" in cmd
 
 
 def test_run_writes_bytes_to_temp_file_before_invoking(bench):
     """``run(bytes)`` writes the bytes to disk and points trtexec at that file."""
     proc = _make_proc(stdout="[I] GPU Compute Time: min = 1.0 ms, max = 2.0 ms, median = 4.25 ms")
-    with patch("subprocess.run", return_value=proc) as run_mock:
+    with patch(_RUN_TRTEXEC, return_value=proc) as run_mock:
         latency = bench.run(b"\x08onnx-bytes")
 
     assert latency == pytest.approx(4.25)
@@ -636,7 +645,7 @@ def test_run_writes_log_file_when_requested(bench, tmp_path):
         stdout="[I] GPU Compute Time: median = 2.0 ms",
         stderr="some warning",
     )
-    with patch("subprocess.run", return_value=proc):
+    with patch(_RUN_TRTEXEC, return_value=proc):
         bench.run(str(tmp_path / "model.onnx"), log_file=str(log_file))
 
     contents = log_file.read_text()
@@ -648,33 +657,33 @@ def test_run_writes_log_file_when_requested(bench, tmp_path):
 def test_run_returns_inf_on_nonzero_returncode(bench, tmp_path):
     """Non-zero exit from trtexec yields ``inf`` and short-circuits parsing."""
     proc = _make_proc(returncode=1, stderr="engine build failed", stdout="")
-    with patch("subprocess.run", return_value=proc):
+    with patch(_RUN_TRTEXEC, return_value=proc):
         assert bench.run(str(tmp_path / "m.onnx")) == float("inf")
 
 
 def test_run_returns_inf_when_latency_not_parseable(bench, tmp_path):
     """Stdout that doesn't match either pattern yields ``inf``."""
     proc = _make_proc(stdout="all done, no latency line here")
-    with patch("subprocess.run", return_value=proc):
+    with patch(_RUN_TRTEXEC, return_value=proc):
         assert bench.run(str(tmp_path / "m.onnx")) == float("inf")
 
 
 def test_run_returns_inf_when_trtexec_binary_missing(bench, tmp_path):
-    """A ``FileNotFoundError`` from subprocess.run is mapped to ``inf``."""
-    with patch("subprocess.run", side_effect=FileNotFoundError):
+    """A ``FileNotFoundError`` from ``_run_trtexec`` is mapped to ``inf``."""
+    with patch(_RUN_TRTEXEC, side_effect=FileNotFoundError):
         assert bench.run(str(tmp_path / "m.onnx")) == float("inf")
 
 
 def test_run_returns_inf_on_unexpected_exception(bench, tmp_path):
     """Any non-FileNotFoundError raised mid-pipeline still yields ``inf``."""
-    with patch("subprocess.run", side_effect=OSError("disk full")):
+    with patch(_RUN_TRTEXEC, side_effect=OSError("disk full")):
         assert bench.run(str(tmp_path / "m.onnx")) == float("inf")
 
 
 def test_call_dunder_forwards_to_run(bench, tmp_path):
     """Calling the benchmark instance directly invokes ``run`` and returns its result."""
     proc = _make_proc(stdout="[I] GPU Compute Time: median = 9.81 ms")
-    with patch("subprocess.run", return_value=proc):
+    with patch(_RUN_TRTEXEC, return_value=proc):
         latency = bench(str(tmp_path / "m.onnx"))
     assert latency == pytest.approx(9.81)
 
@@ -693,7 +702,7 @@ def test_run_parses_std_pattern(bench, tmp_path):
         "[I] GPU Compute Time: min = 0.8 ms, max = 1.2 ms, mean = 0.95 ms, "
         "median = 0.92 ms, percentile(99%) = 1.18 ms\n"
     )
-    with patch("subprocess.run", return_value=_make_proc(stdout=stdout)):
+    with patch(_RUN_TRTEXEC, return_value=_make_proc(stdout=stdout)):
         assert bench.run(str(tmp_path / "m.onnx")) == pytest.approx(0.92)
 
 
@@ -720,14 +729,17 @@ def test_remote_run_scp_then_ssh_trtexec_safe(remote_bench, tmp_path):
     scp_proc = _make_proc()
     safe_stdout = "[01/15/2026-12:00:00] [I] Average over 10 runs - GPU latency: 3.42 ms\n"
     ssh_proc = _make_proc(stdout=safe_stdout)
+    cleanup_proc = _make_proc()
 
-    with patch("subprocess.run", side_effect=[trtexec_proc, scp_proc, ssh_proc]) as run_mock:
+    with (
+        patch(_RUN_TRTEXEC, return_value=trtexec_proc),
+        patch("subprocess.run", side_effect=[scp_proc, ssh_proc, cleanup_proc]) as run_mock,
+    ):
         latency = remote_bench.run(str(tmp_path / "m.onnx"))
 
     assert latency == pytest.approx(3.42)
-    assert run_mock.call_count == 4
-    trtexec_cmd, scp_cmd, ssh_cmd, cleanup_cmd = (c.args[0] for c in run_mock.call_args_list)
-    assert trtexec_cmd[0] == "trtexec"
+    assert run_mock.call_count == 3  # scp, ssh, cleanup
+    scp_cmd, ssh_cmd, cleanup_cmd = (c.args[0] for c in run_mock.call_args_list)
     # The remote URL in this test carries a password, so scp/ssh are prefixed with sshpass.
     assert "scp" in scp_cmd
     assert "alice@10.0.0.5:" in scp_cmd[-1]
@@ -737,7 +749,6 @@ def test_remote_run_scp_then_ssh_trtexec_safe(remote_bench, tmp_path):
     remote_cmd_str = ssh_cmd[-1]
     assert "trtexec_safe" in remote_cmd_str
     assert "--loadEngine=" in remote_cmd_str
-    print(cleanup_cmd)
     assert f"rm -f {remote_bench.remote_engine_path}" in cleanup_cmd
 
 
@@ -746,11 +757,15 @@ def test_remote_run_uses_sshpass_when_password_set(remote_bench, tmp_path):
     trtexec_proc = _make_proc(stdout="")
     scp_proc = _make_proc()
     ssh_proc = _make_proc(stdout="[I] Average over 5 runs - GPU latency: 2.0 ms")
+    cleanup_proc = _make_proc()
 
-    with patch("subprocess.run", side_effect=[trtexec_proc, scp_proc, ssh_proc]) as run_mock:
+    with (
+        patch(_RUN_TRTEXEC, return_value=trtexec_proc),
+        patch("subprocess.run", side_effect=[scp_proc, ssh_proc, cleanup_proc]) as run_mock,
+    ):
         remote_bench.run(str(tmp_path / "m.onnx"))
 
-    _, scp_cmd, ssh_cmd, cleanup_cmd = (c.args[0] for c in run_mock.call_args_list)
+    scp_cmd, ssh_cmd, cleanup_cmd = (c.args[0] for c in run_mock.call_args_list)
     assert scp_cmd[:3] == ["sshpass", "-p", "s3cret"]
     assert ssh_cmd[:3] == ["sshpass", "-p", "s3cret"]
     assert f"rm -f {remote_bench.remote_engine_path}" in cleanup_cmd
@@ -761,11 +776,14 @@ def test_remote_run_scp_failure_returns_inf(remote_bench, tmp_path):
     trtexec_proc = _make_proc(stdout="")
     scp_proc = _make_proc(returncode=1, stderr="permission denied")
 
-    with patch("subprocess.run", side_effect=[trtexec_proc, scp_proc]) as run_mock:
+    with (
+        patch(_RUN_TRTEXEC, return_value=trtexec_proc),
+        patch("subprocess.run", side_effect=[scp_proc]) as run_mock,
+    ):
         latency = remote_bench.run(str(tmp_path / "m.onnx"))
 
     assert latency == float("inf")
-    assert run_mock.call_count == 2  # no ssh call
+    assert run_mock.call_count == 1  # no ssh call
 
 
 def test_remote_run_falls_back_to_trtexec_safe_flag(remote_bench, tmp_path):
@@ -775,14 +793,19 @@ def test_remote_run_falls_back_to_trtexec_safe_flag(remote_bench, tmp_path):
     safe_bin_fail = _make_proc(returncode=127, stderr="trtexec_safe: not found")
     fallback_stdout = "[I] GPU Compute Time: median = 5.55 ms"
     fallback_proc = _make_proc(stdout=fallback_stdout)
+    cleanup_proc = _make_proc()
 
-    with patch(
-        "subprocess.run",
-        side_effect=[trtexec_proc, scp_proc, safe_bin_fail, fallback_proc],
-    ) as run_mock:
+    with (
+        patch(_RUN_TRTEXEC, return_value=trtexec_proc),
+        patch(
+            "subprocess.run",
+            side_effect=[scp_proc, safe_bin_fail, fallback_proc, cleanup_proc],
+        ) as run_mock,
+    ):
         latency = remote_bench.run(str(tmp_path / "m.onnx"))
 
     assert latency == pytest.approx(5.55)
+    # Last remote invoke before cleanup is the fallback; cleanup is the final call.
     fallback_cmd = run_mock.call_args_list[-2].args[0]
     remote_cmd_str = fallback_cmd[-1]
     assert "trtexec --safe" in remote_cmd_str
@@ -795,10 +818,14 @@ def test_remote_run_both_safe_paths_fail_returns_inf(remote_bench, tmp_path):
     scp_proc = _make_proc()
     safe_bin_fail = _make_proc(returncode=127, stderr="not found")
     fallback_fail = _make_proc(returncode=1, stderr="also failed")
+    cleanup_proc = _make_proc()
 
-    with patch(
-        "subprocess.run",
-        side_effect=[trtexec_proc, scp_proc, safe_bin_fail, fallback_fail],
+    with (
+        patch(_RUN_TRTEXEC, return_value=trtexec_proc),
+        patch(
+            "subprocess.run",
+            side_effect=[scp_proc, safe_bin_fail, fallback_fail, cleanup_proc],
+        ),
     ):
         assert remote_bench.run(str(tmp_path / "m.onnx")) == float("inf")
 
@@ -824,10 +851,9 @@ def test_network_timeout_custom_value_stored(tmp_path):
 def test_local_trtexec_call_uses_no_timeout(bench, tmp_path):
     """The local engine build path passes ``timeout=None`` (engine builds can be long)."""
     proc = _make_proc(stdout="[I] GPU Compute Time: median = 1.0 ms")
-    with patch("subprocess.run", return_value=proc) as run_mock:
+    with patch(_RUN_TRTEXEC, return_value=proc) as run_mock:
         bench.run(str(tmp_path / "m.onnx"))
 
-    # Exactly one subprocess call for the local pipeline; timeout must be None.
     assert run_mock.call_count == 1
     assert run_mock.call_args.kwargs.get("timeout") is None
 
@@ -846,16 +872,19 @@ def test_remote_pipeline_passes_timeout_to_scp_and_ssh(tmp_path):
     scp_proc = _make_proc()
     safe_fail = _make_proc(returncode=1, stderr="trtexec_safe not found")
     fallback_proc = _make_proc(stdout="[I] GPU Compute Time: median = 4.0 ms")
+    cleanup_proc = _make_proc()
 
-    with patch(
-        "subprocess.run",
-        side_effect=[trtexec_proc, scp_proc, safe_fail, fallback_proc],
-    ) as run_mock:
+    with (
+        patch(_RUN_TRTEXEC, return_value=trtexec_proc) as trt_mock,
+        patch(
+            "subprocess.run",
+            side_effect=[scp_proc, safe_fail, fallback_proc, cleanup_proc],
+        ) as run_mock,
+    ):
         b.run(str(tmp_path / "m.onnx"))
 
-    # Engine build (call 0) has no timeout; the three remote calls all use it.
-    assert run_mock.call_args_list[0].kwargs.get("timeout") is None
-    for idx in (1, 2, 3):  # scp, ssh trtexec_safe, ssh fallback
+    assert trt_mock.call_args.kwargs.get("timeout") is None
+    for idx in (0, 1, 2):  # scp, ssh trtexec_safe, ssh fallback
         assert run_mock.call_args_list[idx].kwargs.get("timeout") == timeout, (
             f"call {idx} did not receive timeout={timeout}"
         )
@@ -876,7 +905,8 @@ def test_scp_timeout_returns_inf_and_logs(tmp_path, caplog):
 
     with (
         caplog.at_level("ERROR", logger="modelopt.onnx"),
-        patch("subprocess.run", side_effect=[trtexec_proc, timeout_exc]),
+        patch(_RUN_TRTEXEC, return_value=trtexec_proc),
+        patch("subprocess.run", side_effect=[timeout_exc]),
     ):
         assert b.run(str(tmp_path / "m.onnx")) == float("inf")
 
@@ -896,10 +926,11 @@ def test_ssh_trtexec_safe_timeout_returns_inf(tmp_path):
     trtexec_proc = _make_proc(stdout="")
     scp_proc = _make_proc()
     timeout_exc = subprocess.TimeoutExpired(cmd=["ssh"], timeout=1.0)
+    cleanup_proc = _make_proc()
 
-    with patch(
-        "subprocess.run",
-        side_effect=[trtexec_proc, scp_proc, timeout_exc],
+    with (
+        patch(_RUN_TRTEXEC, return_value=trtexec_proc),
+        patch("subprocess.run", side_effect=[scp_proc, timeout_exc, cleanup_proc]),
     ):
         assert b.run(str(tmp_path / "m.onnx")) == float("inf")
 
@@ -918,10 +949,11 @@ def test_ssh_fallback_timeout_returns_inf(tmp_path):
     scp_proc = _make_proc()
     safe_fail = _make_proc(returncode=1, stderr="trtexec_safe failed")
     timeout_exc = subprocess.TimeoutExpired(cmd=["ssh"], timeout=1.0)
+    cleanup_proc = _make_proc()
 
-    with patch(
-        "subprocess.run",
-        side_effect=[trtexec_proc, scp_proc, safe_fail, timeout_exc],
+    with (
+        patch(_RUN_TRTEXEC, return_value=trtexec_proc),
+        patch("subprocess.run", side_effect=[scp_proc, safe_fail, timeout_exc, cleanup_proc]),
     ):
         assert b.run(str(tmp_path / "m.onnx")) == float("inf")
 

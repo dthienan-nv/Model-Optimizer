@@ -24,6 +24,8 @@ import re
 import shutil
 import subprocess  # nosec B404
 import sys
+import threading
+import time
 from collections.abc import Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from importlib.metadata import PackageNotFoundError, distribution
@@ -37,6 +39,24 @@ from modelopt.onnx.logging_config import logger
 from modelopt.onnx.quantization.operators import QDQConvTranspose, QDQCustomOp, QDQNormalization
 from modelopt.onnx.quantization.ort_patching import patch_ort_modules
 
+# Default interval between "still running" heartbeats during long trtexec builds.
+_TRTEXEC_HEARTBEAT_INTERVAL_S = 30.0
+
+# High-signal trtexec / TensorRT phase lines to surface at INFO while streaming.
+# Keep this narrow: full --verbose builder logs are extremely noisy.
+_TRTEXEC_PROGRESS_RE = re.compile(
+    r"(?i)("
+    r"parsing (?:onnx )?model|"
+    r"building engine|"
+    r"engine built|"
+    r"serializing (?:the )?engine|"
+    r"(?:loading|saving) timing cache|"
+    r"\[memusagechange\].*tensorrt\.builder|"
+    r"performance summary|"
+    r"&&&& (?:RUNNING|PASSED|FAILED)"
+    r")"
+)
+
 
 def _check_lib_in_ld_library_path(ld_library_path, lib_pattern):
     for directory in ld_library_path:
@@ -46,28 +66,161 @@ def _check_lib_in_ld_library_path(ld_library_path, lib_pattern):
     return False, None
 
 
+def _format_duration(seconds: float) -> str:
+    """Format a duration for human-readable progress logs."""
+    total = max(0, int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def _is_trtexec_progress_line(line: str) -> bool:
+    """Return True for milestone trtexec lines worth promoting to INFO."""
+    return bool(_TRTEXEC_PROGRESS_RE.search(line))
+
+
 def _run_trtexec(
-    args: list[str] | None = None, timeout: float | None = None
+    args: list[str] | None = None,
+    timeout: float | None = None,
+    *,
+    heartbeat_interval: float = _TRTEXEC_HEARTBEAT_INTERVAL_S,
 ) -> subprocess.CompletedProcess:
-    """Run a 'trtexec' command via subprocess.
+    """Run a 'trtexec' command via subprocess with live progress feedback.
+
+    Engine builds can take many minutes with little or no output. This helper
+    streams stdout/stderr as they arrive (DEBUG for every line, INFO for a few
+    milestone phrases) and emits periodic heartbeat logs so long builds are
+    visibly alive rather than looking hung.
+
+    Short invocations (``timeout`` below ``heartbeat_interval``), such as the
+    version-banner probe in ``_check_for_trtexec``, skip start/heartbeat/finish
+    INFO noise while still capturing output.
 
     Args:
         args: Arguments to pass to trtexec (without the 'trtexec' command itself).
-        timeout: Optional subprocess timeout in seconds.
+        timeout: Optional subprocess timeout in seconds. ``None`` means no limit
+            (typical for engine builds).
+        heartbeat_interval: Seconds between "still running" INFO heartbeats when
+            progress logging is enabled.
 
     Returns:
-        The completed subprocess result.
+        The completed subprocess result with captured stdout/stderr text.
 
     Raises:
         FileNotFoundError: If the 'trtexec' binary is not found in PATH.
+        subprocess.TimeoutExpired: If ``timeout`` elapses before trtexec exits.
     """
     cmd = ["trtexec", *(args or [])]
+    # Only emit progress UX for unbounded / long-running invocations.
+    show_progress = timeout is None or timeout >= heartbeat_interval
+
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)  # nosec B603
+        proc = subprocess.Popen(  # nosec B603 - executable is hardcoded to "trtexec"; only args are caller-supplied.
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
     except FileNotFoundError as e:
         raise FileNotFoundError(
             "'trtexec' binary not found. Please ensure TensorRT is installed and 'trtexec' is in PATH."
         ) from e
+
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    last_output_at = time.monotonic()
+    output_lock = threading.Lock()
+
+    def _drain(stream: io.TextIOBase, chunks: list[str], stream_name: str) -> None:
+        nonlocal last_output_at
+        try:
+            for line in iter(stream.readline, ""):
+                chunks.append(line)
+                with output_lock:
+                    last_output_at = time.monotonic()
+                text = line.rstrip("\n")
+                if not text:
+                    continue
+                logger.debug("[trtexec %s] %s", stream_name, text)
+                if show_progress and _is_trtexec_progress_line(text):
+                    logger.info("[trtexec] %s", text)
+        finally:
+            stream.close()
+
+    assert proc.stdout is not None and proc.stderr is not None
+    readers = [
+        threading.Thread(target=_drain, args=(proc.stdout, stdout_chunks, "stdout"), daemon=True),
+        threading.Thread(target=_drain, args=(proc.stderr, stderr_chunks, "stderr"), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+
+    start_time = time.monotonic()
+    deadline = None if timeout is None else start_time + timeout
+    last_heartbeat_at = start_time
+
+    if show_progress:
+        logger.info(
+            "Starting trtexec (engine builds can take a long time with little output); "
+            "heartbeat every %s",
+            _format_duration(heartbeat_interval),
+        )
+
+    timed_out = False
+    try:
+        while proc.poll() is None:
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
+                timed_out = True
+                proc.kill()
+                break
+            if show_progress and now - last_heartbeat_at >= heartbeat_interval:
+                with output_lock:
+                    silence = now - last_output_at
+                elapsed = _format_duration(now - start_time)
+                if silence >= heartbeat_interval:
+                    logger.info(
+                        "trtexec still running (elapsed %s, no output for %s)",
+                        elapsed,
+                        _format_duration(silence),
+                    )
+                else:
+                    logger.info("trtexec still running (elapsed %s)", elapsed)
+                last_heartbeat_at = now
+            time.sleep(0.2)
+    finally:
+        # Ensure the process has exited (kill path or normal completion) and
+        # drainers finish so captured output is complete.
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        for reader in readers:
+            reader.join(timeout=5)
+
+    stdout = "".join(stdout_chunks)
+    stderr = "".join(stderr_chunks)
+
+    if timed_out:
+        assert timeout is not None
+        raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr)
+
+    if show_progress:
+        logger.info(
+            "trtexec finished in %s (returncode=%s)",
+            _format_duration(time.monotonic() - start_time),
+            proc.returncode,
+        )
+
+    return subprocess.CompletedProcess(
+        args=cmd, returncode=proc.returncode or 0, stdout=stdout, stderr=stderr
+    )
 
 
 def _check_for_trtexec(min_version: str = "10.0") -> str:
