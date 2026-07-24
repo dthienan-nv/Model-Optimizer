@@ -847,6 +847,30 @@ class QDQAutotunerBase:
         if isinstance(quantized_tensors, list):
             quantized_tensors = set(quantized_tensors)
 
+        # Normalize baseline tensor names onto this graph. get_quantized_tensors()
+        # returns DequantizeLinear inputs, which in QDQ models are Q-node outputs
+        # named "<orig>_QuantizeLinear_Output"; this graph only knows "<orig>".
+        # Without normalization the pattern intersection silently drops those
+        # points, so the imported seed is a partial (possibly invalid) placement.
+        graph_tensors: set[str] = set(self.graph.tensor_users_map)
+        for node in self.graph.nodes:
+            graph_tensors.update(t.name for t in node.inputs if t.name)
+            graph_tensors.update(t.name for t in node.outputs if t.name)
+        normalized: set[str] = set()
+        unmatched = 0
+        for name in quantized_tensors:
+            if name in graph_tensors:
+                normalized.add(name)
+            elif name.removesuffix("_QuantizeLinear_Output") in graph_tensors:
+                normalized.add(name.removesuffix("_QuantizeLinear_Output"))
+            else:
+                unmatched += 1
+        logger.info(
+            f"Normalized quantized tensor names: {len(normalized)}/{len(quantized_tensors)} "
+            f"matched the graph ({unmatched} unmatched)"
+        )
+        quantized_tensors = normalized
+
         logger.info(f"Importing insertion points from {len(quantized_tensors)} quantized tensors")
         logger.debug(f"Processing {len(self.regions)} regions")
 
