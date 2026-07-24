@@ -66,6 +66,35 @@ def _region_label(region: Region) -> str:
     return f"region_{region.id}_L{region.level}_{region.type.value}"
 
 
+def _normalize_seed_tensors(autotuner: QDQAutotuner, qdq_model: onnx.ModelProto) -> set[str]:
+    """Map a Q/DQ baseline's quantized-tensor names onto the FP16 graph's tensor names.
+
+    ``get_quantized_tensors`` returns each DequantizeLinear input, which in QDQ models
+    is usually the Q node output named ``<orig>_QuantizeLinear_Output``; the FP16 graph
+    only knows ``<orig>``. Try the raw name first, then the stripped one.
+    """
+    graph_tensors: set[str] = set(autotuner.graph.tensor_users_map)
+    for node in autotuner.graph.nodes:
+        graph_tensors.update(t.name for t in node.inputs if t.name)
+        graph_tensors.update(t.name for t in node.outputs if t.name)
+
+    raw = get_quantized_tensors(qdq_model)
+    mapped: set[str] = set()
+    unmatched: list[str] = []
+    for name in raw:
+        if name in graph_tensors:
+            mapped.add(name)
+        elif name.removesuffix("_QuantizeLinear_Output") in graph_tensors:
+            mapped.add(name.removesuffix("_QuantizeLinear_Output"))
+        else:
+            unmatched.append(name)
+    logger.info(
+        f"Seed tensor mapping: {len(mapped)}/{len(raw)} matched the FP16 graph"
+        + (f"; unmatched e.g. {unmatched[:3]}" if unmatched else "")
+    )
+    return mapped
+
+
 def _group_seed_tensors_by_region(
     autotuner: QDQAutotuner, seed_tensors: set[str]
 ) -> dict[str, set[ResolvedInsertionPoint]]:
@@ -175,9 +204,11 @@ def run_backward_elimination(
         logger.info(f"[eliminate] {tag}: {len(points)} Q/DQ points → {latency:.3f} ms")
         return latency
 
-    # 1. Starting configuration
+    # 1. Starting configuration. Recommended: seed with the heuristic quantizer's
+    #    placement (a plain PTQ model via qdq_baseline_path); full quantization of
+    #    every region is the fallback when no baseline exists.
     if qdq_baseline_path:
-        seed_tensors = get_quantized_tensors(onnx.load(qdq_baseline_path))
+        seed_tensors = _normalize_seed_tensors(autotuner, onnx.load(qdq_baseline_path))
         groups = _group_seed_tensors_by_region(autotuner, seed_tensors)
     else:
         groups = _full_quantization_groups(autotuner)
