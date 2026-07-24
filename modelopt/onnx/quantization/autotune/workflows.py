@@ -28,7 +28,11 @@ import onnx
 
 from modelopt.onnx.logging_config import logger
 from modelopt.onnx.quantization.autotune.autotuner import QDQAutotuner
-from modelopt.onnx.quantization.autotune.benchmark import TensorRTPyBenchmark, TrtExecBenchmark
+from modelopt.onnx.quantization.autotune.benchmark import (
+    BenchmarkInfrastructureError,
+    TensorRTPyBenchmark,
+    TrtExecBenchmark,
+)
 from modelopt.onnx.quantization.autotune.common import Config, PatternCache
 from modelopt.onnx.quantization.qdq_utils import get_quantized_tensors
 
@@ -49,10 +53,13 @@ def benchmark_onnx_model(
 
     Returns:
         Measured median inference latency in milliseconds.
-        Returns float('inf') on failure (invalid model, build error, etc.)
+        Returns float('inf') on scheme-caused failure (invalid model, build error, etc.)
 
     Raises:
-        No exceptions raised - errors are caught and logged, returning float('inf')
+        BenchmarkInfrastructureError: On network/SSH failures (connection loss to the
+            remote timing server or benchmark device, scp errors, timeouts). These say
+            nothing about the scheme being measured, so the run aborts instead of
+            silently recording inf and producing a degraded final model.
     """
     global _benchmark_instance
 
@@ -75,6 +82,10 @@ def benchmark_onnx_model(
         logger.debug(f"Benchmark result: {latency:.2f} ms")
         return latency
 
+    except BenchmarkInfrastructureError:
+        # Network/SSH failure — abort the run (resumable via the state file)
+        # rather than recording inf and finishing with a degraded placement.
+        raise
     except Exception as e:
         logger.error(f"Benchmark error: {e}", exc_info=True)
         return float("inf")

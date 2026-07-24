@@ -149,6 +149,28 @@ class Benchmark(ABC):
             self.logger.warning(f"Failed to save logs to {file}: {e}")
 
 
+class BenchmarkInfrastructureError(RuntimeError):
+    """Benchmark failed for infrastructure reasons (network/SSH), not because of the scheme.
+
+    Scheme-caused build failures (e.g. no kernel implementation for a Q/DQ placement)
+    are deterministic properties of the candidate and are correctly recorded as
+    ``latency=inf``. Infrastructure failures — SSH drops to the remote timing server
+    or benchmark device, scp errors, unreachable hosts — are transient and unrelated
+    to the candidate; recording them as ``inf`` silently discards valid schemes and
+    lets the run finish with a degraded (or empty) Q/DQ placement. Raise this instead
+    so the run aborts immediately and can be resumed once connectivity is restored.
+    """
+
+
+# Signatures of infrastructure (network/SSH) failures in trtexec/ssh/scp output.
+_INFRA_ERROR_RE = re.compile(
+    r"SSH (initialization|connection) failed|Socket error|Connection (reset|refused|timed out)"
+    r"|No route to host|kex_exchange_identification|Failed to resolve hostname"
+    r"|Host key verification failed|lost connection|Broken pipe",
+    re.IGNORECASE,
+)
+
+
 _SAFE_PATTERN = (
     r"\[\d{2}/\d{2}/\d{4}-\d{2}:\d{2}:\d{2}\]\s+\[I\]\s+"
     r"Average over \d+ runs - GPU latency:\s*([\d.]+)\s*ms"
@@ -495,6 +517,12 @@ class TrtExecBenchmark(Benchmark):
             if result.returncode != 0:
                 self.logger.error(f"trtexec failed with return code {result.returncode}")
                 self.logger.error(f"stderr: {result.stderr}")
+                combined = f"{result.stdout}\n{result.stderr}"
+                if _INFRA_ERROR_RE.search(combined):
+                    raise BenchmarkInfrastructureError(
+                        "trtexec failed due to a network/SSH error (not a scheme property); "
+                        f"aborting instead of recording inf: {result.stderr[-500:]}"
+                    )
                 return float("inf")
             latency_pattern = _STD_PATTERN
             if self.has_remote_config and self.is_safe:
@@ -519,7 +547,11 @@ class TrtExecBenchmark(Benchmark):
 
                 if result.returncode != 0:
                     self.logger.error(f"Failed to push engine to remote device: {result.stderr}")
-                    return float("inf")
+                    # scp to the device is pure infrastructure; its failure says
+                    # nothing about the scheme being measured.
+                    raise BenchmarkInfrastructureError(
+                        f"Failed to push engine to remote device: {result.stderr[-500:]}"
+                    )
 
                 @contextlib.contextmanager
                 def cleanup_remote_engine():
@@ -591,6 +623,11 @@ class TrtExecBenchmark(Benchmark):
                 self.logger.error(
                     f"Failed to run trtexec_safe or trtexec with '--safe'\n{result.stdout}\n{result.stderr}"
                 )
+                if _INFRA_ERROR_RE.search(f"{result.stdout}\n{result.stderr}"):
+                    raise BenchmarkInfrastructureError(
+                        "Remote latency measurement failed due to a network/SSH error: "
+                        f"{result.stderr[-500:]}"
+                    )
                 return float("inf")
             if not (match := re.search(latency_pattern, result.stdout, re.IGNORECASE)):
                 # this could be due to creating a degenerate onnx file that can't be engine built.
@@ -601,6 +638,9 @@ class TrtExecBenchmark(Benchmark):
             latency = float(match.group(1))
             self.logger.info(f"TrtExec benchmark (median): {latency:.2f} ms")
             return latency
+        except BenchmarkInfrastructureError:
+            # Infrastructure failures must abort the run, not degrade the result.
+            raise
         except FileNotFoundError as e:
             self.logger.error(
                 f"{e.filename} not found, please ensure system dependencies are installed and in the PATH: \n"
@@ -608,8 +648,10 @@ class TrtExecBenchmark(Benchmark):
             )
             return float("inf")
         except subprocess.TimeoutExpired as e:
+            # Only the ssh/scp/remote-run subprocesses carry a timeout (the engine
+            # build runs without one), so a timeout here is a network property.
             self.logger.error(f"Benchmark timed out: {e}")
-            return float("inf")
+            raise BenchmarkInfrastructureError(f"Network operation timed out: {e}") from e
         except Exception as e:
             self.logger.error(f"Benchmark failed: {e}")
             return float("inf")
