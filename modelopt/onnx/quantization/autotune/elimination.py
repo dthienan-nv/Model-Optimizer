@@ -43,6 +43,8 @@ guaranteed to be no slower than the imported baseline placement (within noise).
 import argparse
 import json
 import shlex
+import subprocess
+import sys
 from pathlib import Path
 
 import onnx
@@ -147,6 +149,31 @@ def _full_quantization_groups(
     return groups
 
 
+def _coalesce_groups(
+    groups: dict[str, set[ResolvedInsertionPoint]], max_groups: int
+) -> dict[str, set[ResolvedInsertionPoint]]:
+    """Merge region groups into at most ``max_groups`` buckets to cap measurement count.
+
+    Groups are ordered by region id (data-flow-ish order) and adjacent groups are
+    bucketed together, so each bucket covers a contiguous stretch of the network.
+    One elimination pass costs one measurement per group; coarse buckets trade
+    per-region resolution for speed.
+    """
+    if max_groups <= 0 or len(groups) <= max_groups:
+        return groups
+    labels = sorted(groups)
+    per_bucket = -(-len(labels) // max_groups)  # ceil division
+    coalesced: dict[str, set[ResolvedInsertionPoint]] = {}
+    for i in range(0, len(labels), per_bucket):
+        bucket = labels[i : i + per_bucket]
+        points: set[ResolvedInsertionPoint] = set()
+        for lb in bucket:
+            points |= groups[lb]
+        coalesced[f"bucket_{i // per_bucket}({bucket[0]}..{bucket[-1]})"] = points
+    logger.info(f"Coalesced {len(labels)} region groups into {len(coalesced)} buckets")
+    return coalesced
+
+
 def run_backward_elimination(
     model_or_path: str | onnx.ModelProto,
     qdq_baseline_path: str | None = None,
@@ -154,6 +181,7 @@ def run_backward_elimination(
     output_dir: str | None = None,
     epsilon_ms: float = 0.1,
     max_passes: int = 3,
+    max_groups: int = 0,
     quant_type: str = "int8",
     default_dq_dtype: str = "float16",
     benchmark_fn=None,
@@ -170,6 +198,8 @@ def run_backward_elimination(
         epsilon_ms: Noise floor; a removal is accepted only if it improves the current
             best latency by more than this.
         max_passes: Maximum coordinate-descent passes over all groups.
+        max_groups: If > 0, coalesce region groups into at most this many buckets
+            (caps the number of measurements per pass).
         quant_type: "int8" (default) or "fp8".
         default_dq_dtype: DequantizeLinear output dtype ("float16" default).
         benchmark_fn: Callable(model_bytes) -> latency_ms. Defaults to the global
@@ -214,6 +244,7 @@ def run_backward_elimination(
         groups = _full_quantization_groups(autotuner)
     if not groups:
         raise ValueError("No insertion points found to start elimination from")
+    groups = _coalesce_groups(groups, max_groups)
 
     active = set(groups)
 
@@ -318,13 +349,26 @@ def main():
     parser.add_argument(
         "--qdq_baseline",
         default=None,
-        help="Pre-quantized model whose Q/DQ placement seeds the search "
-        "(default: full quantization of every region)",
+        help="Pre-quantized model whose Q/DQ placement seeds the search. If omitted "
+        "(cold start), the heuristic quantizer is run first to generate the seed.",
+    )
+    parser.add_argument(
+        "--full_quant_seed",
+        action="store_true",
+        help="Cold start from full quantization of every region instead of "
+        "auto-generating the heuristic quantizer seed",
     )
     parser.add_argument("--output_path", default=None)
     parser.add_argument("--output_dir", default=".")
     parser.add_argument("--epsilon_ms", type=float, default=0.1)
     parser.add_argument("--max_passes", type=int, default=3)
+    parser.add_argument(
+        "--max_groups",
+        type=int,
+        default=0,
+        help="Coalesce region groups into at most N buckets to cap measurements per "
+        "pass (0 = one group per region)",
+    )
     parser.add_argument("--quant_type", default="int8", choices=["int8", "fp8"])
     parser.add_argument("--default_dq_dtype", default="float16")
     parser.add_argument("--timing_cache", default=None)
@@ -358,13 +402,39 @@ def main():
             remote_model_path=args.remote_model_path,
         )
 
+    # Cold start: auto-generate the heuristic quantizer's placement as the seed
+    # (plain PTQ, CPU calibration — no target device needed).
+    qdq_baseline = args.qdq_baseline
+    if qdq_baseline is None and not args.full_quant_seed:
+        seed_dir = Path(args.output_dir)
+        seed_dir.mkdir(parents=True, exist_ok=True)
+        qdq_baseline = str(seed_dir / "heuristic_seed.onnx")
+        logger.info("Cold start: generating heuristic quantizer seed (plain PTQ, CPU calibration)")
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "modelopt.onnx.quantization",
+                "--onnx_path",
+                args.onnx_path,
+                "--output_path",
+                qdq_baseline,
+                "--quantize_mode",
+                args.quant_type,
+                "--calibration_eps",
+                "cpu",
+            ],
+            check=True,
+        )  # nosec B603
+
     run_backward_elimination(
         args.onnx_path,
-        qdq_baseline_path=args.qdq_baseline,
+        qdq_baseline_path=qdq_baseline,
         output_path=args.output_path,
         output_dir=args.output_dir,
         epsilon_ms=args.epsilon_ms,
         max_passes=args.max_passes,
+        max_groups=args.max_groups,
         quant_type=args.quant_type,
         default_dq_dtype=args.default_dq_dtype,
         benchmark_fn=benchmark_fn,
