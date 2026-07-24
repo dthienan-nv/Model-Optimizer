@@ -358,7 +358,7 @@ class TrtExecBenchmark(Benchmark):
         plugin_libraries: list[str] | None = None,
         trtexec_args: list[str] | None = None,
         network_timeout_seconds: float = 60 * 5,  # 5 minutes
-        remote_model_path: str = "trtexec_benchmark_model.trt",
+        remote_model_path: str = "/tmp/trtexec_benchmark_model.trt",
     ):
         """Initialize the trtexec benchmark.
 
@@ -375,7 +375,7 @@ class TrtExecBenchmark(Benchmark):
                                      an engine to the remote device and running trtexec_safe.
                                      If the timeout is exceeded, the benchmark will fail.
             remote_model_path: Path to the remote model on the device.
-                               Default is "trtexec_benchmark_model.trt".
+                               Default is "/tmp/trtexec_benchmark_model.trt".
         """
         super().__init__(timing_cache_file, warmup_runs, timing_runs, plugin_libraries)
         self.trtexec_args = list(trtexec_args) if trtexec_args is not None else []
