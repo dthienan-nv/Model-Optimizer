@@ -419,8 +419,18 @@ class QDQAutotunerBase:
         all_region_ips = pattern.matches(region, self.graph, full_insertion_scheme)
         for ip in all_region_ips:
             node = self.graph.nodes[ip.node_index]
-            # Conv/ConvTranspose/Gemm/MatMul inputs and weights must be excluded together
-            if is_linear_op(node.op) and ip.input_index == 0 and len(node.inputs) >= 2:
+            # Conv/ConvTranspose/Gemm/MatMul inputs and weights must be excluded together —
+            # but only when this region owns the node. A region-output point is resolved
+            # on the consumer side, so ip.node_index may be a node of the NEIGHBORING
+            # region; pairing there would delete the neighbor's weight point, which this
+            # region's scheme can never re-add (observed on RepVGG: 16 conv weights
+            # silently lost, seed placement unreachable).
+            if (
+                is_linear_op(node.op)
+                and ip.input_index == 0
+                and len(node.inputs) >= 2
+                and ip.node_index in region.nodes
+            ):
                 resolved_insertion_points.discard(ip)
                 resolved_insertion_points.discard(
                     ResolvedInsertionPoint(
