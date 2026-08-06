@@ -215,7 +215,6 @@ class TrtExecBenchmark(Benchmark):
         self.remote_ip: str | None = None
         self.remote_port: int | None = None
         self.remote_user: str | None = None
-        self.remote_password: str | None = None
         self.remote_engine_path: str | None = "trtexec_benchmark_model.trt"
         self.remote_bin_path: str = "trtexec"
 
@@ -251,9 +250,8 @@ class TrtExecBenchmark(Benchmark):
             if not remote_config_str.startswith("ssh://"):
                 raise ValueError("Only 'ssh://' remote autotuning config URLs are supported")
             parsed = urlparse(remote_config_str)
-            # parsed.username, parsed.password, parsed.hostname, parsed.port, parsed.query
+            # parsed.username, parsed.hostname, parsed.port, parsed.query
             self.remote_user = parsed.username
-            self.remote_password = parsed.password
             self.remote_ip = parsed.hostname
             self.remote_port = parsed.port
             # Parse query options into a dict
@@ -372,7 +370,7 @@ class TrtExecBenchmark(Benchmark):
                     "ssh",
                     "-p",
                     f"{self.remote_port}",
-                    f"{self.remote_user}:{self.remote_password}@{self.remote_ip}",
+                    f"{self.remote_user}@{self.remote_ip}",
                     f"{ld_path} {trt_path} --loadEngine={self.remote_engine_path}",
                 ]
                 result = subprocess.run(trtexec_safe_cmd, capture_output=True, text=True)  # nosec B603
